@@ -684,32 +684,27 @@ class MEGA
      */
     protected function file_download_url($url, $size, $key, $dest)
     {
-        // Open the cipher
-        $td = mcrypt_module_open(MCRYPT_RIJNDAEL_128, '', 'ctr', '');
-
-        // Create key
-        //$key = MEGAUtil::base64_to_a32($key);
-        $aeskey = array($key[0] ^ $key[4], $key[1] ^ $key[5], $key[2] ^ $key[6], $key[3] ^ $key[7]);
+        // Create AES key
+        $aeskey = array(
+            $key[0] ^ $key[4],
+            $key[1] ^ $key[5],
+            $key[2] ^ $key[6],
+            $key[3] ^ $key[7],
+        );
         $aeskey = MEGAUtil::a32_to_str($aeskey);
 
-        // Create the IV
-        $iv = array($key[4], $key[5], 0, 0);
-        $iv = MEGAUtil::a32_to_str($iv);
-
-        // Initialize encryption module for decryption
-        mcrypt_generic_init($td, $aeskey, $iv);
+        // Initial counter / IV for MEGA CTR
+        $initial_counter = array($key[4], $key[5], 0, 0);
 
         $chunks = $this->get_chunks($size);
         $stream = $this->http_open_stream($url);
 
-        // Fetch response. Due to PHP bugs like http://bugs.php.net/bug.php?id=43782
-        // and http://bugs.php.net/bug.php?id=46049 we can't rely on feof(), but
-        // instead must invoke stream_get_meta_data() each iteration.
         $info = stream_get_meta_data($stream);
         $alive = !$info['eof'];
 
         $ret = 0;
         $buffer = '';
+
         foreach ($chunks as $chunk_start => $chunk_size) {
             // Read chunk from network
             $bytes = strlen($buffer);
@@ -719,26 +714,139 @@ class MEGA
 
                 $bytes = strlen($buffer);
                 $info = stream_get_meta_data($stream);
-                $alive = !$info['eof'] && $data;
+                $alive = !$info['eof'] && $data !== '';
             }
 
             $chunk = substr($buffer, 0, $chunk_size);
             $buffer = $bytes > $chunk_size ? substr($buffer, $chunk_size) : '';
 
-            // Decrypt encrypted chunk
-            $chunk = mdecrypt_generic($td, $chunk);
-            if ($bytes = fwrite($dest, $chunk)) {
-                $ret += $bytes;
+            // Decrypt encrypted chunk using AES-CTR
+            $plain = $this->aes_ctr_crypt_at($chunk, $aeskey, $initial_counter, $chunk_start);
+
+            if (($written = fwrite($dest, $plain)) !== false) {
+                $ret += $written;
             }
         }
 
-        // Terminate decryption handle and close module
-        mcrypt_generic_deinit($td);
-        mcrypt_module_close($td);
         fclose($stream);
 
-        // Returns the number of bytes written
         return $ret;
+    }
+
+    /**
+     * AES-CTR encrypt/decrypt ab einem bestimmten Byte-Offset.
+     *
+     * CTR ist symmetrisch: dieselbe Operation für Encrypt/Decrypt.
+     *
+     * @param string $data
+     * @param string $key
+     *   16-Byte AES key.
+     * @param array $initial_counter
+     *   4 x 32-bit words.
+     * @param int $offset
+     *   Byte offset im Stream.
+     *
+     * @return string
+     */
+    protected function aes_ctr_crypt_at($data, $key, array $initial_counter, $offset = 0)
+    {
+        $block_size = 16;
+        $block_index = (int)floor($offset / $block_size);
+        $skip = $offset % $block_size;
+
+        $counter_block = $this->mega_ctr_counter_bytes($initial_counter, $block_index);
+
+        $out = '';
+        $pos = 0;
+        $len = strlen($data);
+
+        while ($pos < $len) {
+            $keystream = openssl_encrypt(
+                $counter_block,
+                'AES-128-ECB',
+                $key,
+                OPENSSL_RAW_DATA | OPENSSL_ZERO_PADDING
+            );
+
+            if ($skip) {
+                $keystream = substr($keystream, $skip);
+                $skip = 0;
+            }
+
+            $take = min(strlen($keystream), $len - $pos);
+            $out .= (substr($data, $pos, $take) ^ substr($keystream, 0, $take));
+            $pos += $take;
+
+            $counter_block = $this->increment_counter_block($counter_block);
+        }
+
+        return $out;
+    }
+
+    protected function mega_ctr_counter_bytes(array $initial_counter, $block_index)
+    {
+        $counter_block = MEGAUtil::a32_to_str($initial_counter);
+
+        while ($block_index > 0) {
+            $counter_block = $this->increment_counter_block($counter_block);
+            $block_index--;
+        }
+
+        return $counter_block;
+    }
+
+    protected function increment_counter_block($counter_block)
+    {
+        $bytes = array_values(unpack('C*', $counter_block));
+
+        for ($i = 16; $i >= 1; $i--) {
+            $bytes[$i] = ($bytes[$i] + 1) & 0xff;
+            if ($bytes[$i] !== 0) {
+                break;
+            }
+        }
+
+        return pack(
+            'C*',
+            $bytes[1], $bytes[2], $bytes[3], $bytes[4],
+            $bytes[5], $bytes[6], $bytes[7], $bytes[8],
+            $bytes[9], $bytes[10], $bytes[11], $bytes[12],
+            $bytes[13], $bytes[14], $bytes[15], $bytes[16]
+        );
+    }
+
+    /**
+     * Addiert Blockoffset auf den 128-bit CTR Counter.
+     *
+     * @param array $counter
+     * @param int $blocks
+     * @return array
+     */
+    protected function mega_ctr_counter_add(array $counter, $blocks)
+    {
+        $counter = array_values($counter);
+
+        // Wir addieren den Blockoffset auf die unteren 64 Bit des Counters.
+        $low = (($counter[2] & 0xffffffff) << 32) | ($counter[3] & 0xffffffff);
+        $low += $blocks;
+
+        $carry = 0;
+        if ($low > 0xFFFFFFFFFFFFFFFF) {
+            $carry = 1;
+            $low = $low & 0xFFFFFFFFFFFFFFFF;
+        }
+
+        $counter[2] = ($low >> 32) & 0xffffffff;
+        $counter[3] = $low & 0xffffffff;
+
+        if ($carry) {
+            $hi = (($counter[0] & 0xffffffff) << 32) | ($counter[1] & 0xffffffff);
+            $hi = ($hi + $carry) & 0xFFFFFFFFFFFFFFFF;
+            $counter[0] = ($hi >> 32) & 0xffffffff;
+            $counter[1] = $hi & 0xffffffff;
+        }
+
+        return $counter;
     }
 
     protected function get_chunks($size)
@@ -789,21 +897,17 @@ class MEGA
 
         $payload = is_string($req) ? $req : json_encode($req);
 
-        $url = $this->apipath . 'cs?id=' . $this->seqno;
+        $query = array('id' => $this->seqno) + $params;
         if (!empty($this->u_sid)) {
-            $url .= '&sid=' . $this->u_sid;
+            $query['sid'] = $this->u_sid;
         }
+
+        $url = $this->apipath . 'cs?' . http_build_query($query);
 
         $this->log("Making API request: " . $payload);
         $this->seqno++;
 
         $response = $this->http_do_request($url, $payload);
-        /*
-         if ($response->error) {
-        $this->log("API request error (" . $response->code . ")");
-        return FALSE;
-        }
-        */
 
         $this->log('API response: ' . $response);
 
@@ -883,25 +987,246 @@ class MEGA
     }
 
     /**
+     * Parst alte und neue MEGA-Links.
+     *
+     * Unterstützt u.a.:
+     * - https://mega.nz/file/<ph>#<key>
+     * - https://mega.nz/folder/<ph>#<key>
+     * - https://mega.nz/folder/<ph>#<key>/file/<node>
+     * - https://mega.nz/folder/<ph>#<key>/folder/<node>
+     * - Alte Formate: #!<ph>!<key> und #F!<ph>!<key>
      *
      * @param string $link
-     * @return array
+     * @return array|false
      */
     public static function parse_link($link, $component = NULL)
     {
-        $fragment = parse_url($link, PHP_URL_FRAGMENT);
-        if (empty($fragment)) {
+        $parts = parse_url(trim($link));
+        if (!$parts) {
             return FALSE;
         }
-        $matches = array();
-        if (preg_match('/^(F?)\\!([a-zA-Z0-9]+)(?:\\!([a-zA-Z0-9_,\\-]+))?/', $fragment, $matches)) {
-            //return count($matches) > 2 ? array($matches[1], $matches[3]) : array($matches[1]);
+
+        $host = isset($parts['host']) ? strtolower($parts['host']) : '';
+        $path = isset($parts['path']) ? trim($parts['path'], '/') : '';
+        $fragment = isset($parts['fragment']) ? $parts['fragment'] : '';
+
+        // --- Neues Format: /file/<id>#<key>
+        if (preg_match('~^file/([A-Za-z0-9\-_]+)$~', $path, $m)) {
             return array(
-                    'type' => $matches[1] == 'F' ? 'folder' : 'file',
-                    'ph' => $matches[2],
-                ) + (!empty($matches[3]) ? array('key' => $matches[3]) : array());
+                'type' => 'file',
+                'ph' => $m[1],
+                'key' => $fragment !== '' ? preg_split('~/~', $fragment, 2)[0] : NULL,
+            );
         }
+
+        // --- Neues Format: /folder/<id>#<key>[/file/<id>|/folder/<id>]
+        if (preg_match('~^folder/([A-Za-z0-9\-_]+)$~', $path, $m)) {
+            $result = array(
+                'type' => 'folder',
+                'ph' => $m[1],
+            );
+
+            if ($fragment !== '') {
+                $frag_parts = explode('/', $fragment);
+
+                if (!empty($frag_parts[0])) {
+                    $result['key'] = $frag_parts[0];
+                }
+
+                if (count($frag_parts) >= 3) {
+                    if ($frag_parts[1] === 'file') {
+                        $result['selected_file'] = $frag_parts[2];
+                    } else if ($frag_parts[1] === 'folder') {
+                        $result['selected_folder'] = $frag_parts[2];
+                    }
+                }
+            }
+
+            return $result;
+        }
+
+        // --- Altes Format: #!<ph>!<key> oder #F!<ph>!<key>
+        if (!empty($fragment)) {
+            $matches = array();
+            if (preg_match('/^(F?)\\!([a-zA-Z0-9\-_]+)(?:\\!([a-zA-Z0-9_,\\-]+))?/', $fragment, $matches)) {
+                return array(
+                        'type' => $matches[1] === 'F' ? 'folder' : 'file',
+                        'ph' => $matches[2],
+                    ) + (!empty($matches[3]) ? array('key' => $matches[3]) : array());
+            }
+        }
+
         return FALSE;
+    }
+
+
+    /**
+     * Liefert alle Nodes eines öffentlichen Ordners.
+     *
+     * @param string $ph
+     *   Public folder handle.
+     * @param string $key
+     *   Folder key.
+     * @param array $args
+     *   Zusätzliche API-Argumente.
+     *
+     * @return array|false
+     *   Entschlüsselte Nodes oder FALSE.
+     */
+    public function public_folder_nodes($ph, $key, $args = array())
+    {
+        $req = array('a' => 'f', 'c' => 1, 'ca' => 1, 'r' => 1) + $args;
+
+        // Bei Public-Foldern kommt der Root-Handle als Query-Parameter "n".
+        $res = $this->api_req(array($req), array('n' => $ph));
+        if (!$res || !is_array($res)) {
+            return FALSE;
+        }
+
+        $res = array_shift($res);
+        if (empty($res['f']) || !is_array($res['f'])) {
+            return FALSE;
+        }
+
+        $shared_key = MEGAUtil::base64_to_a32($key);
+
+        foreach ($res['f'] as $index => $node) {
+            $dec_key = $this->public_node_decrypt_key($node, $shared_key);
+            if (!$dec_key) {
+                continue;
+            }
+
+            if (!empty($node['a'])) {
+                $attr = MEGAUtil::base64_to_str($node['a']);
+
+                // Dateien haben 8 Wörter Keymaterial, für die Attribute werden
+                // die ersten 4 mit den letzten 4 XOR-verknüpft.
+                if ((int)$node['t'] === 0 && count($dec_key) >= 8) {
+                    $attr_key = array(
+                        $dec_key[0] ^ $dec_key[4],
+                        $dec_key[1] ^ $dec_key[5],
+                        $dec_key[2] ^ $dec_key[6],
+                        $dec_key[3] ^ $dec_key[7],
+                    );
+                } else {
+                    $attr_key = $dec_key;
+                }
+
+                $res['f'][$index]['a'] = MEGACrypto::dec_attr($attr, $attr_key);
+            }
+
+            $res['f'][$index]['decoded_k'] = $dec_key;
+        }
+
+        return $res;
+    }
+
+    /**
+     * Liefert alle Nodes eines öffentlichen Ordners aus einem Link.
+     */
+    public function public_folder_nodes_from_link($link)
+    {
+        $parsed = self::parse_link($link);
+
+        if (empty($parsed['ph']) || $parsed['type'] !== 'folder') {
+            throw new InvalidArgumentException('Public folder handle not found');
+        }
+        if (empty($parsed['key'])) {
+            throw new InvalidArgumentException('Folder key not found');
+        }
+
+        return $this->public_folder_nodes($parsed['ph'], $parsed['key']);
+    }
+
+    /**
+     * Sucht eine Datei innerhalb eines öffentlichen Ordners und liefert
+     * Status, Dateiname und Dateigröße.
+     *
+     * @param string $folder_ph
+     * @param string $folder_key
+     * @param string $file_ph
+     *
+     * @return array|false
+     */
+    public function public_folder_file_info($folder_ph, $folder_key, $file_ph)
+    {
+        $folder = $this->public_folder_nodes($folder_ph, $folder_key);
+        if (!$folder || empty($folder['f'])) {
+            return FALSE;
+        }
+
+        foreach ($folder['f'] as $node) {
+            if (!isset($node['h']) || $node['h'] !== $file_ph) {
+                continue;
+            }
+
+            if ((int)$node['t'] !== 0) {
+                return array(
+                    'status' => 'not_a_file',
+                    'h' => $node['h'],
+                );
+            }
+
+            return array(
+                'status' => 'ok',
+                'h' => $node['h'],
+                'name' => isset($node['a']['n']) ? $node['a']['n'] : NULL,
+                'size' => isset($node['s']) ? (int)$node['s'] : NULL,
+                'node' => $node,
+            );
+        }
+
+        return array(
+            'status' => 'not_found',
+            'h' => $file_ph,
+        );
+    }
+
+    /**
+     * Liest Dateiinfos aus einem modernen Folder-Link wie:
+     * mega.nz/folder/...#.../file/...
+     */
+    public function public_folder_file_info_from_link($link)
+    {
+        $parsed = self::parse_link($link);
+
+        if (empty($parsed['ph']) || $parsed['type'] !== 'folder') {
+            throw new InvalidArgumentException('Public folder handle not found');
+        }
+        if (empty($parsed['key'])) {
+            throw new InvalidArgumentException('Folder key not found');
+        }
+        if (empty($parsed['selected_file'])) {
+            throw new InvalidArgumentException('Selected file handle not found');
+        }
+
+        return $this->public_folder_file_info(
+            $parsed['ph'],
+            $parsed['key'],
+            $parsed['selected_file']
+        );
+    }
+
+    /**
+     * Entschlüsselt den Node-Key eines Public-Folder-Nodes mit dem Folder-Key.
+     *
+     * @param array $node
+     * @param array $shared_key_a32
+     * @return array|false
+     */
+    protected function public_node_decrypt_key($node, $shared_key_a32)
+    {
+        if (empty($node['k'])) {
+            return FALSE;
+        }
+
+        $parts = explode(':', $node['k'], 2);
+        if (count($parts) !== 2 || empty($parts[1])) {
+            return FALSE;
+        }
+
+        $enc_key = MEGAUtil::base64_to_a32($parts[1]);
+        return MEGACrypto::decrypt_key(MEGAUtil::a32_to_str($shared_key_a32), $enc_key);
     }
 }
 
@@ -1054,8 +1379,8 @@ class MEGACrypto
     // AES encrypt in CBC mode (zero IV)
     public static function encrypt_aes_cbc($key, $data)
     {
-        $iv = str_repeat("\0", mcrypt_get_iv_size(MCRYPT_RIJNDAEL_128, MCRYPT_MODE_CBC));
-        return mcrypt_encrypt(MCRYPT_RIJNDAEL_128, $key, $data, MCRYPT_MODE_CBC, $iv);
+        $iv = str_repeat("\0", 16);
+        return openssl_encrypt($data, 'AES-128-CBC', $key, OPENSSL_RAW_DATA | OPENSSL_ZERO_PADDING, $iv);
     }
 
     // AES decrypt in CBC mode (zero IV)
@@ -1066,7 +1391,8 @@ class MEGACrypto
 
     public static function decrypt_aes_cbc($key, $data)
     {
-        return openssl_decrypt($data, 'AES-128-CBC', $key, OPENSSL_RAW_DATA | OPENSSL_ZERO_PADDING);
+        $iv = str_repeat("\0", 16);
+        return openssl_decrypt($data, 'AES-128-CBC', $key, OPENSSL_RAW_DATA | OPENSSL_ZERO_PADDING, $iv);
     }
 
 
