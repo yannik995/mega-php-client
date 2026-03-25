@@ -8,8 +8,7 @@ PHP client library for the [MEGA API](https://mega.co.nz/#developers).
 Requirements
 ------------
 
-* PHP 5.x
-* PHP Mcrypt extension
+* PHP 8.x
 * PHP OpenSSL extension
 * PHP cURL extension
 
